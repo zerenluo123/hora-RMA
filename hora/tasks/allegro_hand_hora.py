@@ -79,6 +79,10 @@ class AllegroHandHora(VecTask):
 
         self.prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self.cur_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+
+        self.forward_vec = to_torch([0., 0., 1.], device=self.device).repeat((self.num_envs, 1))
+        self.prev_object_rot = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device)
+
         # object apply random forces parameters
         self.force_scale = self.config['env'].get('forceScale', 0.0)
         self.random_force_prob_scalar = self.config['env'].get('randomForceProbScalar', 0.0)
@@ -336,9 +340,11 @@ class AllegroHandHora(VecTask):
         torque_pscale = self.torque_penalty_scale
         work_pscale = self.work_penalty_scale
 
+        object_angvel_from_quat = angular_velocities(self.prev_object_rot, self.object_rot, self.dt)
+
         self.rew_buf[:], log_r_reward, olv_penalty = compute_hand_reward(
             self.object_linvel, obj_linv_pscale,
-            self.object_angvel, self.rot_axis_buf, self.rotate_reward_scale,
+            object_angvel_from_quat, self.rot_axis_buf, self.rotate_reward_scale,
             self.angvel_clip_max, self.angvel_clip_min,
             pose_diff_penalty, pose_diff_pscale,
             torque_penalty, torque_pscale,
@@ -350,9 +356,9 @@ class AllegroHandHora(VecTask):
         self.extras['pose_diff_penalty'] = pose_diff_penalty.mean()
         self.extras['work_done'] = work_penalty.mean()
         self.extras['torques'] = torque_penalty.mean()
-        self.extras['roll'] = self.object_angvel[:, 0].mean()
-        self.extras['pitch'] = self.object_angvel[:, 1].mean()
-        self.extras['yaw'] = self.object_angvel[:, 2].mean()
+        self.extras['roll'] = object_angvel_from_quat[:, 0].mean()
+        self.extras['pitch'] = object_angvel_from_quat[:, 1].mean()
+        self.extras['yaw'] = object_angvel_from_quat[:, 2].mean()
 
         if self.evaluate:
             finished_episode_mask = self.reset_buf == 1
@@ -397,6 +403,10 @@ class AllegroHandHora(VecTask):
                 self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], objectx[0], objectx[1], objectx[2]], [0.85, 0.1, 0.1])
                 self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], objecty[0], objecty[1], objecty[2]], [0.1, 0.85, 0.1])
                 self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], objectz[0], objectz[1], objectz[2]], [0.1, 0.1, 0.85])
+
+        # record the rot for calculating the ang vel
+        self.prev_object_rot[:] = self.object_rot[:]
+        # print("*** ", quat_apply(self.object_rot, self.forward_vec))
 
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
@@ -638,3 +648,15 @@ def compute_hand_reward(
     reward = reward + torque_penalty * torque_pscale
     reward = reward + work_penalty * work_pscale
     return reward, rotate_reward, object_linvel_penalty
+
+# quaternion different converted to angular velocity. The angular velocity is too noisy
+# https://mariogc.com/post/angular-velocity-quaternions/
+def angular_velocities(prev_object_rot, cur_object_rot, dt):
+    return (2 / dt) * torch.cat((
+        (prev_object_rot[:, 0]*cur_object_rot[:, 1] - prev_object_rot[:, 1]*cur_object_rot[:, 0]
+        - prev_object_rot[:, 2]*cur_object_rot[:, 3] + prev_object_rot[:, 3]*cur_object_rot[:, 2]).unsqueeze(1),
+        (prev_object_rot[:, 0]*cur_object_rot[:, 2] + prev_object_rot[:, 1]*cur_object_rot[:, 3]
+        - prev_object_rot[:, 2]*cur_object_rot[:, 0] - prev_object_rot[:, 3]*cur_object_rot[:, 1]).unsqueeze(1),
+        (prev_object_rot[:, 0]*cur_object_rot[:, 3] - prev_object_rot[:, 1]*cur_object_rot[:, 2]
+        + prev_object_rot[:, 2]*cur_object_rot[:, 1] - prev_object_rot[:, 3]*cur_object_rot[:, 0]).unsqueeze(1)
+        ), dim=-1)
